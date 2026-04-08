@@ -13,20 +13,89 @@ TaskFlow is a production-grade, distributed background job processing system bui
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Architecture & Project Map
 
-TaskFlow relies on strict dependency boundaries:
+TaskFlow relies on strict Clean Architecture dependency boundaries. The innermost layers define the rules, and the outermost layers wire up the physical implementation.
 
-* **TaskFlow.Domain**: The heart of the system. Enforces an invariant-rich `Job` aggregate that tightly controls state transitions without external pollution.
-* **TaskFlow.Application**: Contains the core `JobProcessor` orchestration loop. Resolves domain types dynamically safely shielding specific business requirements from workflow mechanics.
-* **TaskFlow.Infrastructure**: Entity Framework Core `DbContexts`, Concurrency Tokens, and the high-speed backend `InMemoryJobQueue`. 
-* **TaskFlow.Worker**: A BackgroundService tracking application lifetimes, wrapping executions in `IServiceScopes`, preventing crashes natively.
-* **TaskFlow.Api**: Minimal API surface area providing the gateway to enqueue work and query system state.
+```mermaid
+graph TD
+    API("🌐 TaskFlow.Api<br/>(Dependency Injection, Endpoints)") 
+    WORKER("⚙️ TaskFlow.Worker<br/>(Background Services, Sweepers)")
+    INFRA("☁️ TaskFlow.Infrastructure<br/>(EF Core, InMemory Channels)")
+    APP("🧠 TaskFlow.Application<br/>(JobProcessor, Handlers)")
+    DOMAIN("🎯 TaskFlow.Domain<br/>(Job Entity, Invariants, Interfaces)")
+
+    %% Dependency Arrows
+    API -->|Consumes/Registers| APP
+    API -->|Registers| INFRA
+    WORKER -->|Consumes| APP
+    INFRA -->|Implements Ports For| APP
+    INFRA -->|Maps| DOMAIN
+    APP -->|Coordinates| DOMAIN
+    
+    %% Styling
+    classDef core fill:#4f46e5,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef infra fill:#0ea5e9,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef pres fill:#f59e0b,stroke:#fff,stroke-width:2px,color:#fff;
+
+    class DOMAIN,APP core;
+    class INFRA infra;
+    class API,WORKER pres;
+```
+
+### Layer Breakdown
+* **`TaskFlow.Domain`**: Enforces an invariant-rich `Job` aggregate that tightly controls state transitions without external pollution. Zero dependencies.
+* **`TaskFlow.Application`**: Contains the core orchestrator (`JobProcessor`). Retrieves jobs, validates idempotency, and delegates to your custom `IJobHandler` configurations.
+* **`TaskFlow.Infrastructure`**: Contains the physical Adapters. Houses our SQL Server `DbContext` and the `InMemoryJobQueue` channel logic. 
+* **`TaskFlow.Worker`**: The Background Services tracking machine lifetimes, isolating DB transactions under `IServiceScopes`, and capturing all execution anomalies to prevent service crashes natively.
+
+---
+
+## 🔄 The Lifecycle of a Job
+
+How data logically flows from standard creation down to successful execution:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Api as API Endpoints
+    participant DB as TaskFlowDb (SQL)
+    participant Q as InMemory Queue
+    participant Worker as Job Worker
+    participant Handler as IJobHandler
+
+    Client->>Api: POST /jobs { Payload }
+    Api->>DB: Inserts State (Pending)
+    Api->>Q: EnqueueAsync(JobId)
+    Api-->>Client: 202 Accepted
+    
+    Q->>Worker: Waits for JobId / Dequeues
+    Worker->>DB: JobProcessor attempts MarkAsProcessing()
+    
+    alt Concurrency Winner
+        DB-->>Worker: Row Locked Successfully
+        Worker->>Handler: ExecuteAsync(Deserialized Payload)
+        Handler-->>Worker: Execution Success
+        Worker->>DB: MarkAsCompleted()
+    else Worker Crash / Stale Lock
+        Worker-XDB: Machine physically crashes mid-execution
+        DB->>DB: JobSweeper detects lock expiration 10s later
+        DB-->>Q: JobSweeper requeues to Pending
+    end
+```
+
+### States
+1. **Pending**: Triggered into existence via Database insert.
+2. **Scheduled**: Paused waiting for `ScheduledFor` to intersect with UTC Now. Picked up seamlessly by the `JobSweeper`.
+3. **Processing**: System safely locks the row by generating a transient `workerId`. 
+4. **Completed**: Business logic passed cleanly!
+5. **Failed**: Handler threw an Exception. The worker catches it, logs it, recalculates exponentially, and re-publishes.
+6. **DeadLettered**: Reached exact `MaxRetry` threshold.
 
 ---
 
 ## 🔌 API Endpoints
-Minimal routing to observe and dispatch:
 
 ### `GET /health`
 Returns system status.
@@ -48,21 +117,9 @@ Returns the specific Domain metrics for a designated job.
 ```json
 {
   "id": "e3b0c442-989b-464c-869f-...",
-  "stateName": "Processing",
-  "state": 2 
+  "stateName": "Processing"
 }
 ```
-
----
-
-## 🔄 The Lifecycle of a Job
-
-1. **Pending**: Triggered into existence via Database insert.
-2. **Scheduled**: Paused waiting for `ScheduledFor` to intersect with UTC Now. Picked up seamlessly by the `JobSweeper`.
-3. **Processing**: System safely locks the row by generating a transient `workerId`. 
-4. **Completed**: Business logic passed cleanly!
-5. **Failed**: Handler threw an Exception. The worker immediately catches it, logs the output, recalculates backoff, and re-publishes to the Queue.
-6. **DeadLettered**: Reached exact `MaxRetry` threshold. Left in the database untouched so engineers can triage the structural bug.
 
 ---
 
@@ -74,4 +131,4 @@ Returns the specific Domain metrics for a designated job.
 ```csharp
 services.AddTaskFlowSystem("Server=.;Database=TaskFlowDB;Trusted_Connection=True;");
 ```
-4. Run `dotnet restore` and build! Ensure `TaskFlow.Api` is instantiated properly alongside the BackgroundServices.
+4. Run `dotnet restore` and build! Ensure `TaskFlow.Api` is instantiated properly alongside the integrated Background Services.
