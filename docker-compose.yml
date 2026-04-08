@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: taskflowdb
+      POSTGRES_USER: taskflow_user
+      POSTGRES_PASSWORD: SecretPassword123!
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow_user -d taskflowdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.Api
+    ports:
+      - "5000:5000"
+    environment:
+      - ConnectionStrings__TaskFlowDb=Host=db;Database=taskflowdb;Username=taskflow_user;Password=SecretPassword123!
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.Worker
+    environment:
+      - ConnectionStrings__TaskFlowDb=Host=db;Database=taskflowdb;Username=taskflow_user;Password=SecretPassword123!
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

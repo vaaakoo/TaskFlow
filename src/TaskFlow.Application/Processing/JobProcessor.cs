@@ -34,87 +34,82 @@ public class JobProcessor : IJobProcessor
             var job = await _jobRepository.GetByIdAsync(jobId, cancellationToken);
             if (job == null) return;
 
-            // 1. Safety Guards
+            // 1. Immutable Safety Guards
             if (job.State == JobState.Completed || job.State == JobState.DeadLettered)
             {
-                _logger.LogInformation("Job {JobId} skipped. Idempotency guard triggered (Status: {State}).", jobId, job.State);
+                _logger.LogInformation("Idempotency guard triggered: Job {JobId} (State: {State}). Skipping.", jobId, job.State);
                 return;
             }
 
             if (job.State == JobState.Processing)
             {
-                _logger.LogInformation("Job {JobId} skipped. Already processing/locked.", jobId);
+                _logger.LogDebug("Job {JobId} is strictly locked. Skipping redundant parallel execution attempt.", jobId);
                 return;
             }
 
-            if (job.State == JobState.Scheduled && job.ScheduledFor > DateTimeOffset.UtcNow)
-            {
-                _logger.LogDebug("Job {JobId} skipped. Scheduled in the future at {ScheduledFor}.", jobId, job.ScheduledFor);
-                return; 
-            }
-
-            // 2. Lock Acquisition
+            // 2. Concurrency Lock
             try
             {
-                job.MarkAsProcessing(Guid.NewGuid().ToString("N"));
+                // The worker lock naturally expires avoiding infinite blackholing.
+                job.MarkAsProcessing(Guid.NewGuid().ToString("N"), TimeSpan.FromMinutes(5));
                 await _jobRepository.UpdateAsync(job, cancellationToken);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                _logger.LogDebug("Concurrency conflict acquiring lock for Job {JobId}. Handled cleanly.", jobId);
+                _logger.LogInformation("Optimistic Concurrency blocked redundant lock for Job {JobId}. Error: {Message}", jobId, ex.Message);
                 return; 
             }
 
-            _logger.LogInformation("Job {JobId} started processing.", jobId);
+            _logger.LogInformation("Job {JobId} started processing natively.", jobId);
 
-            // 3. Delegation & Deserialization
+            // 3. Delegation & Isolated Deserialization
             IJobHandler handler;
             object deserializedPayload;
             try
             {
                 var targetType = _handlerResolver.ResolvePayloadType(job.PayloadType);
                 deserializedPayload = JsonSerializer.Deserialize(job.Payload, targetType) 
-                    ?? throw new InvalidOperationException("Payload deserialized to null.");
+                    ?? throw new InvalidOperationException("Payload deserialization resulted in null allocation.");
                 handler = _handlerResolver.ResolveHandler(job.PayloadType);
             }
             catch (Exception ex)
             {
-                await HandleFailureAsync(job, ex, cancellationToken);
-                return;
+                await HandleFailureLocallyAsync(job, ex, cancellationToken);
+                return; // Must strictly return to prevent further execution!
             }
 
-            // 4. Execution Loop
+            // 4. Action Execution
             await handler.ExecuteAsync(deserializedPayload, cancellationToken);
 
             job.MarkAsCompleted();
             await _jobRepository.UpdateAsync(job, cancellationToken);
-            _logger.LogInformation("Job {JobId} completed successfully.", jobId);
+            
+            _logger.LogInformation("Job {JobId} completed execution sequentially.", jobId);
         }
         catch (Exception ex)
         {
-             // Last resort containment. Never throw to calling Host.
-             _logger.LogError(ex, "Unexpected hard failure inside ProcessAsync for Job {JobId}.", jobId);
+             // Utter containment check enforcing worker survival rules
+             _logger.LogError(ex, "Job {JobId} triggered critical unbounded runtime failure.", jobId);
         }
     }
 
-    private async Task HandleFailureAsync(Job job, Exception ex, CancellationToken cancellationToken)
+    private async Task HandleFailureLocallyAsync(Job job, Exception ex, CancellationToken cancellationToken)
     {
-        _logger.LogError(ex, "Job {JobId} failed during handler execution.", job.Id);
+        _logger.LogError(ex, "Execution failed sequentially for Job {JobId}.", job.Id);
         job.MarkAsFailed(ex.ToString());
 
         if (job.State != JobState.DeadLettered)
         {
             var nextRetryTime = DateTimeOffset.UtcNow.AddSeconds(Math.Pow(2, job.RetryCount + 1));
-
             job.IncrementRetry(nextRetryTime);
-            await _jobRepository.UpdateAsync(job, cancellationToken);
             
-            _logger.LogInformation("Retry {RetryCount} scheduled for Job {JobId} at {NextRetryTime}.", job.RetryCount, job.Id, nextRetryTime);
+            await _jobRepository.UpdateAsync(job, cancellationToken);
+            _logger.LogInformation("Job {JobId} failed. Native exponential retry scheduled at {NextRetryTime}.", job.Id, nextRetryTime);
         }
         else
         {
             await _jobRepository.UpdateAsync(job, cancellationToken);
-            _logger.LogCritical("Job {JobId} exceeded max retries and is DEAD-LETTERED.", job.Id);
+            _logger.LogCritical("Job {JobId} met dead-lettered threshold boundaries.", job.Id);
         }
     }
 }

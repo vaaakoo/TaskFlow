@@ -30,7 +30,7 @@ public class JobSweeper : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("JobSweeper started. Polling every 10 seconds.");
+        _logger.LogInformation("JobSweeper bounds initialized. Polling executing every 10 seconds.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -38,13 +38,10 @@ public class JobSweeper : BackgroundService
             {
                 await SweepJobsAsync(stoppingToken);
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error in JobSweeper loop.");
+                _logger.LogError(ex, "Sweeper loop failed to map database. Soft recovery active.");
             }
 
             await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
@@ -57,38 +54,39 @@ public class JobSweeper : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<TaskFlowDbContext>();
         var now = DateTimeOffset.UtcNow;
 
-        // 1. Recover Stuck Processing Jobs (Crash Recovery)
+        // --- 1. CRASH RECOVERY (Stale Locks) ---
+        // Context: If a machine pulls the plug mid-execution, its lock persists forever.
+        // We find jobs stuck in "Processing" where the LockExpiresAt is strictly in the past.
         var stuckJobs = await db.Jobs
             .Where(j => j.State == JobState.Processing && j.LockExpiresAt < now)
             .ToListAsync(ct);
 
         foreach (var job in stuckJobs)
         {
-            _logger.LogWarning("Recovering crashed Job {JobId}. Resetting state from stale Processing lock.", job.Id);
+            _logger.LogWarning("Crash Recovery! Job {JobId} is stale (Locked processing expired). Resetting.", job.Id);
             
-            // We leverage the Domain constraint creatively. Mark it failed due to the worker crash, and requeue it.
-            job.MarkAsFailed("Worker processing lock expired. Assumed offline or OOM crash.");
-            
+            // Mark it failed, but immediately trigger IncrementRetry mapping to bypass DeadLetter bounds if allowed
+            job.MarkAsFailed("Worker processing lock organically expired. Assumed offline.");
             if (job.State != JobState.DeadLettered)
             {
-                job.IncrementRetry(null); // Return it natively back to Pending
-                _jobQueue.EnqueueAsync(job.Id, ct).ConfigureAwait(false);
+                job.IncrementRetry(null); // Force it to Pending naturally through the Domain
+                await _jobQueue.EnqueueAsync(job.Id, ct);
             }
         }
 
-        // 2. Poll Database for Jobs that are due for execution right now
-        var scheduledJobIds = await db.Jobs
+        // --- 2. SCHEDULED EXECUTION ---
+        var scheduledJods = await db.Jobs
             .Where(j => j.State == JobState.Scheduled && j.ScheduledFor <= now)
             .Select(j => j.Id)
             .ToListAsync(ct);
 
-        foreach (var id in scheduledJobIds)
+        foreach (var id in scheduledJods)
         {
-            _logger.LogInformation("Enqueuing natively Scheduled Job {JobId} for immediate processing.", id);
+            _logger.LogInformation("Sweeper pulling natively Scheduled Job {JobId} to active channel.", id);
             await _jobQueue.EnqueueAsync(id, ct);
         }
 
-        if (stuckJobs.Any()) // Only stuck jobs mutate the context state here
+        if (stuckJobs.Any()) 
         {
             await db.SaveChangesAsync(ct);
         }

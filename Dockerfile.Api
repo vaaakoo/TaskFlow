@@ -1,0 +1,26 @@
+# Build Phase
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /app
+
+# Copy Solution/Projects for layer caching
+COPY src/TaskFlow.Api/*.csproj src/TaskFlow.Api/
+COPY src/TaskFlow.Worker/*.csproj src/TaskFlow.Worker/
+COPY src/TaskFlow.Application/*.csproj src/TaskFlow.Application/
+COPY src/TaskFlow.Domain/*.csproj src/TaskFlow.Domain/
+COPY src/TaskFlow.Infrastructure/*.csproj src/TaskFlow.Infrastructure/
+
+RUN dotnet restore src/TaskFlow.Api/TaskFlow.Api.csproj
+
+# Build API
+COPY src/ src/
+WORKDIR /app/src/TaskFlow.Api
+RUN dotnet publish -c Release -o /out
+
+# Runtime Phase
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+WORKDIR /app
+COPY --from=build /out ./
+EXPOSE 5000
+ENV ASPNETCORE_URLS=http://+:5000
+
+ENTRYPOINT ["dotnet", "TaskFlow.Api.dll"]

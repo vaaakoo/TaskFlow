@@ -1,134 +1,82 @@
 # TaskFlow 🚀
 
-TaskFlow is a production-grade, distributed background job processing system built on .NET. Designed with **Clean Architecture** and **Domain-Driven Design (DDD)**, it provides extreme reliability, optimistic concurrency control, and robust crash recovery methods.
-
-## ✨ Core Features
-
-* **Resilient Distribution**: Built to scale. Workers acquire pessimistic/optimistic locks via EF Core row versioning, ensuring two workers never process the same job instance twice.
-* **Smart Retry & Exponential Backoff**: Transient failures are automatically requeued safely with exponential backoff delays ($2^{retry \ count}$ seconds).
-* **Dead-Letter Queues**: Exhausted jobs are gracefully parked in a `DeadLettered` state requiring manual intervention to prevent infinite failure loops.
-* **Automated Sweeper & Crash Recovery**: If a host machine suddenly dies (OOM, Hardware Failure) while holding a job lock, a self-healing `JobSweeper` gracefully identifies the stale lease, handles the required domain transitions, and puts the job back in the execution queue.
-* **Ultra-low latency MVP**: Deploys utilizing `System.Threading.Channels` as an in-memory queue, delivering jobs precisely with microseconds of latency without requiring external infrastructure brokers (like RabbitMQ) out-of-the-box.
-* **Delayed / Scheduled Execution**: Full support for natively scheduling jobs in the future.
+TaskFlow is a production-grade, distributed background job processing system natively designed for .NET. Built strictly utilizing **Clean Architecture** and **Domain-Driven Design (DDD)**, it guarantees absolute worker reliability, optimistic concurrency control, and zero-loss crash recovery workflows without requiring external brokers out-of-the-box.
 
 ---
 
-## 🏗️ Architecture & Project Map
+## 🏗️ Clean Architecture & Flow
 
-TaskFlow relies on strict Clean Architecture dependency boundaries. The innermost layers define the rules, and the outermost layers wire up the physical implementation.
+The system consists of three main components communicating synchronously with absolute data sovereignty.
 
 ```mermaid
 graph TD
-    API("🌐 TaskFlow.Api<br/>(Dependency Injection, Endpoints)") 
-    WORKER("⚙️ TaskFlow.Worker<br/>(Background Services, Sweepers)")
-    INFRA("☁️ TaskFlow.Infrastructure<br/>(EF Core, InMemory Channels)")
-    APP("🧠 TaskFlow.Application<br/>(JobProcessor, Handlers)")
-    DOMAIN("🎯 TaskFlow.Domain<br/>(Job Entity, Invariants, Interfaces)")
+    API("🌐 TaskFlow.Api<br/>(API Controller)") 
+    DB[("🐘 PostgreSQL<br/>(Source of Truth)")]
+    WORKER("⚙️ TaskFlow.Worker<br/>(Background Services)")
 
-    %% Dependency Arrows
-    API -->|Consumes/Registers| APP
-    API -->|Registers| INFRA
-    WORKER -->|Consumes| APP
-    INFRA -->|Implements Ports For| APP
-    INFRA -->|Maps| DOMAIN
-    APP -->|Coordinates| DOMAIN
-    
-    %% Styling
-    classDef core fill:#4f46e5,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef infra fill:#0ea5e9,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef pres fill:#f59e0b,stroke:#fff,stroke-width:2px,color:#fff;
-
-    class DOMAIN,APP core;
-    class INFRA infra;
-    class API,WORKER pres;
+    %% Flows
+    API -->|1. Creates Job| DB
+    WORKER -->|3. Commits Execution| DB
+    WORKER -->|2. Sweeps DB to Feed Memory Channel| DB
 ```
 
-### Layer Breakdown
-* **`TaskFlow.Domain`**: Enforces an invariant-rich `Job` aggregate that tightly controls state transitions without external pollution. Zero dependencies.
-* **`TaskFlow.Application`**: Contains the core orchestrator (`JobProcessor`). Retrieves jobs, validates idempotency, and delegates to your custom `IJobHandler` configurations.
-* **`TaskFlow.Infrastructure`**: Contains the physical Adapters. Houses our SQL Server `DbContext` and the `InMemoryJobQueue` channel logic. 
-* **`TaskFlow.Worker`**: The Background Services tracking machine lifetimes, isolating DB transactions under `IServiceScopes`, and capturing all execution anomalies to prevent service crashes natively.
+### Component Interaction Deep-dive
+1. **API**: Receives an HTTP POST and invokes `IJobRepository`. It saves the `Job` Entity into Postgres as the single source of truth (`Status: Pending`).
+2. **Worker (JobSweeper)**: A Background loop querying Postgres every 10 seconds. It pulls natively structured `Pending` jobs into a high-speed `InMemory Channel`. 
+3. **Worker (JobWorker)**: Sits blocked on the channel. Instantly dequeues memory instances, issues a strict Distributed Lock (`MarkAsProcessing`), and fires exact business logic configurations.
 
 ---
 
-## 🔄 The Lifecycle of a Job
+## 🚦 Failure Scenarios & Recovery
 
-How data logically flows from standard creation down to successful execution:
+TaskFlow maps real-world system outages directly into its unanemic Business Domain seamlessly to ensure zero execution leakage. 
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant Api as API Endpoints
-    participant DB as TaskFlowDb (SQL)
-    participant Q as InMemory Queue
-    participant Worker as Job Worker
-    participant Handler as IJobHandler
-
-    Client->>Api: POST /jobs { Payload }
-    Api->>DB: Inserts State (Pending)
-    Api->>Q: EnqueueAsync(JobId)
-    Api-->>Client: 202 Accepted
-    
-    Q->>Worker: Waits for JobId / Dequeues
-    Worker->>DB: JobProcessor attempts MarkAsProcessing()
-    
-    alt Concurrency Winner
-        DB-->>Worker: Row Locked Successfully
-        Worker->>Handler: ExecuteAsync(Deserialized Payload)
-        Handler-->>Worker: Execution Success
-        Worker->>DB: MarkAsCompleted()
-    else Worker Crash / Stale Lock
-        Worker-XDB: Machine physically crashes mid-execution
-        DB->>DB: JobSweeper detects lock expiration 10s later
-        DB-->>Q: JobSweeper requeues to Pending
-    end
-```
-
-### States
-1. **Pending**: Triggered into existence via Database insert.
-2. **Scheduled**: Paused waiting for `ScheduledFor` to intersect with UTC Now. Picked up seamlessly by the `JobSweeper`.
-3. **Processing**: System safely locks the row by generating a transient `workerId`. 
-4. **Completed**: Business logic passed cleanly!
-5. **Failed**: Handler threw an Exception. The worker catches it, logs it, recalculates exponentially, and re-publishes.
-6. **DeadLettered**: Reached exact `MaxRetry` threshold.
+| Failure Scenario | Defensive Mechanism | Resolution Outcome |
+| :--- | :--- | :--- |
+| **Duplicate Delivery Attempt** | Idempotency Check | Job is skipped harmlessly by the Application Guard. |
+| **Two workers fetching identical Jobs** | Optimistic Concurrency | `DbUpdateConcurrencyException` aborts the trailing worker instantly. |
+| **Hardware / OOM Crash mid-execution** | JobSweeper Timeout Rule | Sweeper identifies `LockExpiresAt < now`, flags failure gracefully, and requeues natively to `Pending`. |
+| **3rd Party API Outage (e.g. Email Down)**| Handler Exception Trap | Catches the thrown error securely, recalculates Exponential Backoff natively, and logs `Failed`. |
 
 ---
 
-## 🔌 API Endpoints
+## 🧐 Trade-Offs & Decisions
 
-### `GET /health`
-Returns system status.
-
-### `POST /jobs`
-Submits a new job.
-**Request Body**:
-```json
-{
-  "type": "SendEmail",
-  "payloadType": "TaskFlow.Integrations.Email.SendEmailPayload",
-  "payload": "{\"To\": \"user@example.com\", \"Body\": \"Hello World!\"}"
-}
-```
-
-### `GET /jobs/{id}`
-Returns the specific Domain metrics for a designated job.
-**Response**:
-```json
-{
-  "id": "e3b0c442-989b-464c-869f-...",
-  "stateName": "Processing"
-}
-```
+* **Why No Redis or RabbitMQ?** 
+  To demonstrate extreme infrastructure parsimony, this project orchestrates the robust `.NET System.Threading.Channels` as an incredibly low-latency internal loop, utilizing the relational database as its durability anchor. Adding Redis simply for basic queueing when EF Core RowVersions provide bullet-proof atomic locks introduces unnecessary operational bloat for MVP footprints.
+* **Why Database Polling (Sweeper)?**
+  If two detached Docker containers must synchronize state without a TCP-based Message Broker, polling the physical database is mathematically necessary. We mitigate "Tight Loops" and CPU hammering by bounding the sweeps exactly 10s apart, ensuring instant local Channel pickup the moment the data arrives while retaining pristine network health metrics.
 
 ---
 
-## 🚀 Getting Started
+## 🐳 Getting Started (Zero-Friction Docker)
 
-1. Clone the repository.
-2. Ensure you have the latest .NET SDK installed.
-3. Hook up your SQL connection string to `DependencyInjection.cs`:
-```csharp
-services.AddTaskFlowSystem("Server=.;Database=TaskFlowDB;Trusted_Connection=True;");
+Run the entire suite locally within seconds using Docker. This boots the API, identical Worker process, and a mapped Postgres instance.
+
+> [!NOTE] 
+> Automatic migrations (`Database.Migrate()`) will trigger safely on startup syncing the EF Core models precisely to the raw database. Ensure you run `dotnet ef migrations add` natively if scaling custom domain columns.
+
+```bash
+docker-compose up --build
 ```
-4. Run `dotnet restore` and build! Ensure `TaskFlow.Api` is instantiated properly alongside the integrated Background Services.
+
+### ⚡ Quick Test (30 seconds)
+
+**1. Create a Distributed Job**
+```bash
+curl -X POST http://localhost:5000/jobs \
+     -H "Content-Type: application/json" \
+     -d '{"type": "SendEmail", "payloadType": "TaskFlow.Integrations.SendEmailPayload", "payload": "{\"To\": \"user@example.com\"}"}'
+```
+*You will immediately see the Worker log acknowledging the sweep and mapping execution traces!*
+
+**2. Query Native Status**
+Replace the wildcard UUID with your specific ID generated above:
+```bash
+curl http://localhost:5000/jobs/e3b0c442-989b-464c-869f-0123456789ab
+```
+
+**3. Health Check**
+```bash
+curl http://localhost:5000/health
+```
